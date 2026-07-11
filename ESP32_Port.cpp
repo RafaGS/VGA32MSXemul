@@ -27,6 +27,14 @@ uint8_t *XBuf = NULL;
 
 static fabgl::VGA16Controller* vga16 = nullptr;
 
+// Devuelve el puntero a VGA16Controller, enlazándolo bajo demanda si aún no
+// se ha hecho. Centraliza el patrón "if(!vga16) vga16 = &VGAController;"
+// que antes se repetía en varios sitios.
+static inline fabgl::VGA16Controller* ensureVga16() {
+  if (!vga16) vga16 = &VGAController;
+  return vga16;
+}
+
 // === 색상 보정 설정 (정상 작동 확인됨) ===
 #define COLOR_MAP_RGB  // 변환 없음 (표준 RGB 배열 - 빨간색/녹색/파란색 정상)
 
@@ -48,244 +56,164 @@ fabgl::RGB888 convertColor(byte R, byte G, byte B) {
   return color;
 }
 
-// 키보드 매핑 매크로 (MSX는 Active Low 방식)
-#define PRESS(r, b) KeyState[r] &= ~(b)
-#define RELEASE(r, b) KeyState[r] |= (b)
 
-// [복구] 원본 파일의 ProcessKey 함수 (오타 수정 및 전체 매핑 복원)
+// ============================================================================
+// Mapeo de teclado -> matriz MSX (activa a nivel bajo / Active Low)
+// ============================================================================
+//
+// CAUSA RAIZ DEL BUG ORIGINAL:
+// FabGL resuelve el estado de SHIFT/CAPSLOCK dentro del propio driver de
+// teclado (Keyboard::manageCAPSLOCK / Keyboard::VKtoAlternateVK en
+// keyboard.cpp) ANTES de entregarnos la virtual key. Esto significa que:
+//
+//   - Una letra SIN mayúsculas llega como VK_a..VK_z (minúscula)
+//   - La misma letra CON SHIFT llega como VK_A..VK_Z (mayúscula)
+//     -> son dos virtual keys distintas, no una sola con un flag de shift.
+//   - Un símbolo con SHIFT llega como una virtual key DERIVADA distinta:
+//     VK_1->VK_EXCLAIM, VK_QUOTE->VK_QUOTEDBL, VK_SLASH->VK_QUESTION, etc.
+//
+// El switch original solo contemplaba VK_A..VK_Z (mayúsculas) y los símbolos
+// "base" sin SHIFT. Por eso:
+//   - Las minúsculas (que es como llegan las letras SIN shift) no coincidían
+//     con ningún case -> no se reconocía la letra en absoluto sin Shift.
+//   - Los símbolos con SHIFT (! @ # $ % ^ & * ( ) _ + : " < > ? { } | ~)
+//     tampoco tenían case propio -> se perdían.
+//
+// LA SOLUCIÓN no es tratar el shift a mano: ambas variantes (base y
+// derivada) deben apuntar a la MISMA posición row/bit de la matriz MSX,
+// porque es la propia BIOS del MSX la que decide mayúscula/minúscula/símbolo
+// en función del bit de SHIFT (fila 6, bit 0x01), que ya se envía aparte.
+//
+// Se sustituyen los dos switch (PRESS/RELEASE) —duplicados y ahora también
+// desincronizables— por una única tabla de datos recorrida por una sola
+// función. Así solo hay un sitio donde añadir/corregir una tecla.
+// ============================================================================
+
+static inline void PressKey(uint8_t row, uint8_t mask) {
+  KeyState[row] &= ~mask;
+}
+
+static inline void ReleaseKey(uint8_t row, uint8_t mask) {
+  KeyState[row] |= mask;
+}
+
+struct KeyMapEntry {
+  fabgl::VirtualKey vk;
+  uint8_t row;
+  uint8_t mask;
+};
+
+static constexpr KeyMapEntry KeyMap[] = {
+  // --- Fila 0: 0-7 (+ símbolos derivados de SHIFT, + teclado numérico) ---
+  { fabgl::VK_0, 0, 0x01 }, { fabgl::VK_RIGHTPAREN, 0, 0x01 }, { fabgl::VK_KP_0, 0, 0x01 },
+  { fabgl::VK_1, 0, 0x02 }, { fabgl::VK_EXCLAIM,    0, 0x02 }, { fabgl::VK_KP_1, 0, 0x02 },
+  { fabgl::VK_2, 0, 0x04 }, { fabgl::VK_AT,         0, 0x04 }, { fabgl::VK_KP_2, 0, 0x04 },
+  { fabgl::VK_3, 0, 0x08 }, { fabgl::VK_HASH,       0, 0x08 }, { fabgl::VK_KP_3, 0, 0x08 },
+  { fabgl::VK_4, 0, 0x10 }, { fabgl::VK_DOLLAR,     0, 0x10 }, { fabgl::VK_KP_4, 0, 0x10 },
+  { fabgl::VK_5, 0, 0x20 }, { fabgl::VK_PERCENT,    0, 0x20 }, { fabgl::VK_KP_5, 0, 0x20 },
+  { fabgl::VK_6, 0, 0x40 }, { fabgl::VK_CARET,      0, 0x40 }, { fabgl::VK_KP_6, 0, 0x40 },
+  { fabgl::VK_7, 0, 0x80 }, { fabgl::VK_AMPERSAND,  0, 0x80 }, { fabgl::VK_KP_7, 0, 0x80 },
+
+  // --- Fila 1: 8, 9, -, =, \, [, ], ; (+ símbolos con SHIFT) ---
+  { fabgl::VK_8,            1, 0x01 }, { fabgl::VK_ASTERISK,    1, 0x01 }, { fabgl::VK_KP_8, 1, 0x01 },
+  { fabgl::VK_9,            1, 0x02 }, { fabgl::VK_LEFTPAREN,   1, 0x02 }, { fabgl::VK_KP_9, 1, 0x02 },
+  { fabgl::VK_MINUS,        1, 0x04 }, { fabgl::VK_UNDERSCORE,  1, 0x04 }, { fabgl::VK_KP_MINUS, 1, 0x04 },
+  { fabgl::VK_EQUALS,       1, 0x08 }, { fabgl::VK_PLUS,        1, 0x08 },
+  { fabgl::VK_BACKSLASH,    1, 0x10 }, { fabgl::VK_VERTICALBAR, 1, 0x10 },
+  { fabgl::VK_LEFTBRACKET,  1, 0x20 }, { fabgl::VK_LEFTBRACE,   1, 0x20 },
+  { fabgl::VK_RIGHTBRACKET, 1, 0x40 }, { fabgl::VK_RIGHTBRACE,  1, 0x40 },
+  { fabgl::VK_SEMICOLON,    1, 0x80 }, { fabgl::VK_COLON,       1, 0x80 }, { fabgl::VK_KP_PLUS, 1, 0x80 }, // numpad + -> ; (mapeo original)
+
+  // --- Fila 2: ', `, ,, ., /, (dead), A, B ---
+  { fabgl::VK_QUOTE,       2, 0x01 }, { fabgl::VK_QUOTEDBL, 2, 0x01 },
+  { fabgl::VK_GRAVEACCENT, 2, 0x02 }, { fabgl::VK_TILDE,    2, 0x02 },
+  { fabgl::VK_COMMA,       2, 0x04 }, { fabgl::VK_LESS,     2, 0x04 },
+  { fabgl::VK_PERIOD,      2, 0x08 }, { fabgl::VK_GREATER,  2, 0x08 }, { fabgl::VK_KP_PERIOD, 2, 0x08 }, // numpad . (mapeo original)
+  { fabgl::VK_SLASH,       2, 0x10 }, { fabgl::VK_QUESTION, 2, 0x10 }, { fabgl::VK_KP_DIVIDE, 2, 0x10 }, // numpad / (mapeo original)
+  // bit 0x20 = dead key -> se descarta intencionadamente (igual que el original)
+  { fabgl::VK_A, 2, 0x40 }, { fabgl::VK_a, 2, 0x40 },
+  { fabgl::VK_B, 2, 0x80 }, { fabgl::VK_b, 2, 0x80 }, { fabgl::VK_KP_MULTIPLY, 2, 0x80 }, // numpad * -> : (mapeo original)
+
+  // --- Fila 3: C, D, E, F, G, H, I, J ---
+  { fabgl::VK_C, 3, 0x01 }, { fabgl::VK_c, 3, 0x01 },
+  { fabgl::VK_D, 3, 0x02 }, { fabgl::VK_d, 3, 0x02 },
+  { fabgl::VK_E, 3, 0x04 }, { fabgl::VK_e, 3, 0x04 },
+  { fabgl::VK_F, 3, 0x08 }, { fabgl::VK_f, 3, 0x08 },
+  { fabgl::VK_G, 3, 0x10 }, { fabgl::VK_g, 3, 0x10 },
+  { fabgl::VK_H, 3, 0x20 }, { fabgl::VK_h, 3, 0x20 },
+  { fabgl::VK_I, 3, 0x40 }, { fabgl::VK_i, 3, 0x40 },
+  { fabgl::VK_J, 3, 0x80 }, { fabgl::VK_j, 3, 0x80 },
+
+  // --- Fila 4: K, L, M, N, O, P, Q, R ---
+  { fabgl::VK_K, 4, 0x01 }, { fabgl::VK_k, 4, 0x01 },
+  { fabgl::VK_L, 4, 0x02 }, { fabgl::VK_l, 4, 0x02 },
+  { fabgl::VK_M, 4, 0x04 }, { fabgl::VK_m, 4, 0x04 },
+  { fabgl::VK_N, 4, 0x08 }, { fabgl::VK_n, 4, 0x08 },
+  { fabgl::VK_O, 4, 0x10 }, { fabgl::VK_o, 4, 0x10 },
+  { fabgl::VK_P, 4, 0x20 }, { fabgl::VK_p, 4, 0x20 },
+  { fabgl::VK_Q, 4, 0x40 }, { fabgl::VK_q, 4, 0x40 },
+  { fabgl::VK_R, 4, 0x80 }, { fabgl::VK_r, 4, 0x80 },
+
+  // --- Fila 5: S, T, U, V, W, X, Y, Z ---
+  { fabgl::VK_S, 5, 0x01 }, { fabgl::VK_s, 5, 0x01 },
+  { fabgl::VK_T, 5, 0x02 }, { fabgl::VK_t, 5, 0x02 },
+  { fabgl::VK_U, 5, 0x04 }, { fabgl::VK_u, 5, 0x04 },
+  { fabgl::VK_V, 5, 0x08 }, { fabgl::VK_v, 5, 0x08 },
+  { fabgl::VK_W, 5, 0x10 }, { fabgl::VK_w, 5, 0x10 },
+  { fabgl::VK_X, 5, 0x20 }, { fabgl::VK_x, 5, 0x20 },
+  { fabgl::VK_Y, 5, 0x40 }, { fabgl::VK_y, 5, 0x40 },
+  { fabgl::VK_Z, 5, 0x80 }, { fabgl::VK_z, 5, 0x80 },
+
+  // --- Fila 6: SHIFT, CTRL, GRAPH, CAPS, CODE, F1, F2, F3 ---
+  { fabgl::VK_LSHIFT, 6, 0x01 }, { fabgl::VK_RSHIFT, 6, 0x01 },
+  { fabgl::VK_LCTRL,  6, 0x02 }, { fabgl::VK_RCTRL,  6, 0x02 },
+  { fabgl::VK_LALT,     6, 0x04 }, // GRAPH
+  { fabgl::VK_CAPSLOCK, 6, 0x08 },
+  { fabgl::VK_RALT,     6, 0x10 }, // CODE
+  { fabgl::VK_F1, 6, 0x20 },
+  { fabgl::VK_F2, 6, 0x40 },
+  { fabgl::VK_F3, 6, 0x80 },
+
+  // --- Fila 7: F4, F5, ESC, TAB, STOP, BS, SELECT, RETURN ---
+  { fabgl::VK_F4,        7, 0x01 },
+  { fabgl::VK_F5,        7, 0x02 },
+  { fabgl::VK_ESCAPE,    7, 0x04 },
+  { fabgl::VK_TAB,       7, 0x08 },
+  { fabgl::VK_PAUSE,     7, 0x10 }, // STOP
+  { fabgl::VK_BACKSPACE, 7, 0x20 },
+  { fabgl::VK_HOME,      7, 0x40 }, // SELECT
+  { fabgl::VK_RETURN,    7, 0x80 },
+
+  // --- Fila 8: SPACE, HOME(CLS), INS, DEL, LEFT, UP, DOWN, RIGHT ---
+  { fabgl::VK_SPACE,  8, 0x01 },
+  { fabgl::VK_END,    8, 0x02 }, // HOME(CLS)
+  { fabgl::VK_INSERT, 8, 0x04 },
+  { fabgl::VK_DELETE, 8, 0x08 },
+  { fabgl::VK_LEFT,   8, 0x10 },
+  { fabgl::VK_UP,     8, 0x20 },
+  { fabgl::VK_DOWN,   8, 0x40 },
+  { fabgl::VK_RIGHT,  8, 0x80 },
+};
+
+static constexpr int KeyMapSize = sizeof(KeyMap) / sizeof(KeyMap[0]);
+
 void ProcessKey(fabgl::VirtualKey vk, bool down) {
-  if (down) {
-    switch(vk) {
-      // Row 0: 0-7
-      case fabgl::VK_0: PRESS(0, 0x01); break;
-      case fabgl::VK_1: PRESS(0, 0x02); break;
-      case fabgl::VK_2: PRESS(0, 0x04); break;
-      case fabgl::VK_3: PRESS(0, 0x08); break;
-      case fabgl::VK_4: PRESS(0, 0x10); break;
-      case fabgl::VK_5: PRESS(0, 0x20); break;
-      case fabgl::VK_6: PRESS(0, 0x40); break;
-      case fabgl::VK_7: PRESS(0, 0x80); break;
-      
-      // Row 1: 8, 9, -, =, \, [, ], ;
-      case fabgl::VK_8: PRESS(1, 0x01); break;
-      case fabgl::VK_9: PRESS(1, 0x02); break;
-      case fabgl::VK_MINUS: PRESS(1, 0x04); break;
-      case fabgl::VK_EQUALS: PRESS(1, 0x08); break;
-      case fabgl::VK_BACKSLASH: PRESS(1, 0x10); break;
-      case fabgl::VK_LEFTBRACKET: PRESS(1, 0x20); break;
-      case fabgl::VK_RIGHTBRACKET: PRESS(1, 0x40); break;
-      case fabgl::VK_SEMICOLON: PRESS(1, 0x80); break;
+  // Tecla de salida (F12): no forma parte de la matriz MSX
+  if (down && vk == fabgl::VK_F12) {
+    ExitNow = 1;
+    return;
+  }
 
-      // Row 2: ', `, ,, ., /, Dead, A, B
-      case fabgl::VK_QUOTE: PRESS(2, 0x01); break;
-      case fabgl::VK_GRAVEACCENT: PRESS(2, 0x02); break;
-      case fabgl::VK_COMMA: PRESS(2, 0x04); break;
-      case fabgl::VK_PERIOD: PRESS(2, 0x08); break;
-      case fabgl::VK_SLASH: PRESS(2, 0x10); break;
-      // Dead key는 스킵
-      case fabgl::VK_A: PRESS(2, 0x40); break;
-      case fabgl::VK_B: PRESS(2, 0x80); break;
-
-      // Row 3: C, D, E, F, G, H, I, J
-      case fabgl::VK_C: PRESS(3, 0x01); break;
-      case fabgl::VK_D: PRESS(3, 0x02); break;
-      case fabgl::VK_E: PRESS(3, 0x04); break;
-      case fabgl::VK_F: PRESS(3, 0x08); break;
-      case fabgl::VK_G: PRESS(3, 0x10); break;
-      case fabgl::VK_H: PRESS(3, 0x20); break;
-      case fabgl::VK_I: PRESS(3, 0x40); break;
-      case fabgl::VK_J: PRESS(3, 0x80); break;
-
-      // Row 4: K, L, M, N, O, P, Q, R
-      case fabgl::VK_K: PRESS(4, 0x01); break;
-      case fabgl::VK_L: PRESS(4, 0x02); break;
-      case fabgl::VK_M: PRESS(4, 0x04); break;
-      case fabgl::VK_N: PRESS(4, 0x08); break;
-      case fabgl::VK_O: PRESS(4, 0x10); break;
-      case fabgl::VK_P: PRESS(4, 0x20); break;
-      case fabgl::VK_Q: PRESS(4, 0x40); break;
-      case fabgl::VK_R: PRESS(4, 0x80); break;
-
-      // Row 5: S, T, U, V, W, X, Y, Z
-      case fabgl::VK_S: PRESS(5, 0x01); break;
-      case fabgl::VK_T: PRESS(5, 0x02); break;
-      case fabgl::VK_U: PRESS(5, 0x04); break;
-      case fabgl::VK_V: PRESS(5, 0x08); break;
-      case fabgl::VK_W: PRESS(5, 0x10); break;
-      case fabgl::VK_X: PRESS(5, 0x20); break;
-      case fabgl::VK_Y: PRESS(5, 0x40); break;
-      case fabgl::VK_Z: PRESS(5, 0x80); break;
-
-      // Row 6: SHIFT, CTRL, GRAPH, CAPS, CODE, F1, F2, F3
-      case fabgl::VK_LSHIFT: 
-      case fabgl::VK_RSHIFT: PRESS(6, 0x01); break;
-      case fabgl::VK_LCTRL: 
-      case fabgl::VK_RCTRL: PRESS(6, 0x02); break;
-      case fabgl::VK_LALT: PRESS(6, 0x04); break; // GRAPH key
-      case fabgl::VK_CAPSLOCK: PRESS(6, 0x08); break;
-      case fabgl::VK_RALT: PRESS(6, 0x10); break; // CODE key
-      case fabgl::VK_F1: PRESS(6, 0x20); break;
-      case fabgl::VK_F2: PRESS(6, 0x40); break;
-      case fabgl::VK_F3: PRESS(6, 0x80); break;
-
-      // Row 7: F4, F5, ESC, TAB, STOP, BS, SELECT, RETURN
-      case fabgl::VK_F4: PRESS(7, 0x01); break;
-      case fabgl::VK_F5: PRESS(7, 0x02); break;
-      case fabgl::VK_ESCAPE: PRESS(7, 0x04); break;
-      case fabgl::VK_TAB: PRESS(7, 0x08); break;
-      case fabgl::VK_PAUSE: PRESS(7, 0x10); break; // STOP key
-      case fabgl::VK_BACKSPACE: PRESS(7, 0x20); break;
-      case fabgl::VK_HOME: PRESS(7, 0x40); break; // SELECT key
-      case fabgl::VK_RETURN: PRESS(7, 0x80); break;
-
-      // Row 8: SPACE, HOME(CLS), INS, DEL, LEFT, UP, DOWN, RIGHT
-      case fabgl::VK_SPACE: PRESS(8, 0x01); break;
-      case fabgl::VK_END: PRESS(8, 0x02); break; // HOME(CLS) key
-      case fabgl::VK_INSERT: PRESS(8, 0x04); break;
-      case fabgl::VK_DELETE: PRESS(8, 0x08); break;
-      case fabgl::VK_LEFT: PRESS(8, 0x10); break;
-      case fabgl::VK_UP: PRESS(8, 0x20); break;
-      case fabgl::VK_DOWN: PRESS(8, 0x40); break;
-      case fabgl::VK_RIGHT: PRESS(8, 0x80); break;
-
-      // 텐키 숫자 매핑
-      case fabgl::VK_KP_0: PRESS(0, 0x01); break; // 0
-      case fabgl::VK_KP_1: PRESS(0, 0x02); break; // 1
-      case fabgl::VK_KP_2: PRESS(0, 0x04); break; // 2
-      case fabgl::VK_KP_3: PRESS(0, 0x08); break; // 3
-      case fabgl::VK_KP_4: PRESS(0, 0x10); break; // 4
-      case fabgl::VK_KP_5: PRESS(0, 0x20); break; // 5
-      case fabgl::VK_KP_6: PRESS(0, 0x40); break; // 6
-      case fabgl::VK_KP_7: PRESS(0, 0x80); break; // 7
-      case fabgl::VK_KP_8: PRESS(1, 0x01); break; // 8
-      case fabgl::VK_KP_9: PRESS(1, 0x02); break; // 9
-
-      // 텐키 기호 매핑
-      case fabgl::VK_KP_MULTIPLY: PRESS(2, 0x80); break; // * -> :
-      case fabgl::VK_KP_PLUS: PRESS(1, 0x80); break;     // + -> ;
-      case fabgl::VK_KP_MINUS: PRESS(1, 0x04); break;    // -
-      case fabgl::VK_KP_DIVIDE: PRESS(2, 0x10); break;   // /
-      case fabgl::VK_KP_PERIOD: PRESS(2, 0x08); break;   // .
-
-      // 종료 키
-      case fabgl::VK_F12: ExitNow = 1; break;
-      
-      default: break;
-    }
-  } else {
-    // Key Up Event
-    switch(vk) {
-      // Row 0
-      case fabgl::VK_0: RELEASE(0, 0x01); break;
-      case fabgl::VK_1: RELEASE(0, 0x02); break;
-      case fabgl::VK_2: RELEASE(0, 0x04); break;
-      case fabgl::VK_3: RELEASE(0, 0x08); break;
-      case fabgl::VK_4: RELEASE(0, 0x10); break;
-      case fabgl::VK_5: RELEASE(0, 0x20); break;
-      case fabgl::VK_6: RELEASE(0, 0x40); break;
-      case fabgl::VK_7: RELEASE(0, 0x80); break;
-      
-      // Row 1
-      case fabgl::VK_8: RELEASE(1, 0x01); break;
-      case fabgl::VK_9: RELEASE(1, 0x02); break;
-      case fabgl::VK_MINUS: RELEASE(1, 0x04); break;
-      case fabgl::VK_EQUALS: RELEASE(1, 0x08); break;
-      case fabgl::VK_BACKSLASH: RELEASE(1, 0x10); break;
-      case fabgl::VK_LEFTBRACKET: RELEASE(1, 0x20); break;
-      case fabgl::VK_RIGHTBRACKET: RELEASE(1, 0x40); break;
-      case fabgl::VK_SEMICOLON: RELEASE(1, 0x80); break;
-
-      // Row 2
-      case fabgl::VK_QUOTE: RELEASE(2, 0x01); break;
-      case fabgl::VK_GRAVEACCENT: RELEASE(2, 0x02); break;
-      case fabgl::VK_COMMA: RELEASE(2, 0x04); break;
-      case fabgl::VK_PERIOD: RELEASE(2, 0x08); break;
-      case fabgl::VK_SLASH: RELEASE(2, 0x10); break;
-      case fabgl::VK_A: RELEASE(2, 0x40); break;
-      case fabgl::VK_B: RELEASE(2, 0x80); break;
-
-      // Row 3
-      case fabgl::VK_C: RELEASE(3, 0x01); break;
-      case fabgl::VK_D: RELEASE(3, 0x02); break;
-      case fabgl::VK_E: RELEASE(3, 0x04); break;
-      case fabgl::VK_F: RELEASE(3, 0x08); break;
-      case fabgl::VK_G: RELEASE(3, 0x10); break;
-      case fabgl::VK_H: RELEASE(3, 0x20); break;
-      case fabgl::VK_I: RELEASE(3, 0x40); break;
-      case fabgl::VK_J: RELEASE(3, 0x80); break;
-
-      // Row 4
-      case fabgl::VK_K: RELEASE(4, 0x01); break;
-      case fabgl::VK_L: RELEASE(4, 0x02); break;
-      case fabgl::VK_M: RELEASE(4, 0x04); break;
-      case fabgl::VK_N: RELEASE(4, 0x08); break;
-      case fabgl::VK_O: RELEASE(4, 0x10); break;
-      case fabgl::VK_P: RELEASE(4, 0x20); break;
-      case fabgl::VK_Q: RELEASE(4, 0x40); break;
-      case fabgl::VK_R: RELEASE(4, 0x80); break;
-
-      // Row 5
-      case fabgl::VK_S: RELEASE(5, 0x01); break;
-      case fabgl::VK_T: RELEASE(5, 0x02); break;
-      case fabgl::VK_U: RELEASE(5, 0x04); break;
-      case fabgl::VK_V: RELEASE(5, 0x08); break;
-      case fabgl::VK_W: RELEASE(5, 0x10); break;
-      case fabgl::VK_X: RELEASE(5, 0x20); break;
-      case fabgl::VK_Y: RELEASE(5, 0x40); break;
-      case fabgl::VK_Z: RELEASE(5, 0x80); break;
-
-      // Row 6
-      case fabgl::VK_LSHIFT: 
-      case fabgl::VK_RSHIFT: RELEASE(6, 0x01); break;
-      case fabgl::VK_LCTRL: 
-      case fabgl::VK_RCTRL: RELEASE(6, 0x02); break;
-      case fabgl::VK_LALT: RELEASE(6, 0x04); break;
-      case fabgl::VK_CAPSLOCK: RELEASE(6, 0x08); break;
-      case fabgl::VK_RALT: RELEASE(6, 0x10); break;
-      case fabgl::VK_F1: RELEASE(6, 0x20); break;
-      case fabgl::VK_F2: RELEASE(6, 0x40); break;
-      case fabgl::VK_F3: RELEASE(6, 0x80); break;
-
-      // Row 7
-      case fabgl::VK_F4: RELEASE(7, 0x01); break;
-      case fabgl::VK_F5: RELEASE(7, 0x02); break;
-      case fabgl::VK_ESCAPE: RELEASE(7, 0x04); break;
-      case fabgl::VK_TAB: RELEASE(7, 0x08); break;
-      case fabgl::VK_PAUSE: RELEASE(7, 0x10); break;
-      case fabgl::VK_BACKSPACE: RELEASE(7, 0x20); break;
-      case fabgl::VK_HOME: RELEASE(7, 0x40); break;
-      case fabgl::VK_RETURN: RELEASE(7, 0x80); break;
-
-      // Row 8
-      case fabgl::VK_SPACE: RELEASE(8, 0x01); break;
-      case fabgl::VK_END: RELEASE(8, 0x02); break;
-      case fabgl::VK_INSERT: RELEASE(8, 0x04); break;
-      case fabgl::VK_DELETE: RELEASE(8, 0x08); break;
-      case fabgl::VK_LEFT: RELEASE(8, 0x10); break;
-      case fabgl::VK_UP: RELEASE(8, 0x20); break;
-      case fabgl::VK_DOWN: RELEASE(8, 0x40); break;
-      case fabgl::VK_RIGHT: RELEASE(8, 0x80); break;
-
-      // 텐키
-      case fabgl::VK_KP_0: RELEASE(0, 0x01); break;
-      case fabgl::VK_KP_1: RELEASE(0, 0x02); break;
-      case fabgl::VK_KP_2: RELEASE(0, 0x04); break;
-      case fabgl::VK_KP_3: RELEASE(0, 0x08); break;
-      case fabgl::VK_KP_4: RELEASE(0, 0x10); break;
-      case fabgl::VK_KP_5: RELEASE(0, 0x20); break;
-      case fabgl::VK_KP_6: RELEASE(0, 0x40); break;
-      case fabgl::VK_KP_7: RELEASE(0, 0x80); break;
-      case fabgl::VK_KP_8: RELEASE(1, 0x01); break;
-      case fabgl::VK_KP_9: RELEASE(1, 0x02); break;
-      case fabgl::VK_KP_MULTIPLY: RELEASE(2, 0x80); break;
-      case fabgl::VK_KP_PLUS: RELEASE(1, 0x80); break;
-      case fabgl::VK_KP_MINUS: RELEASE(1, 0x04); break;
-      case fabgl::VK_KP_DIVIDE: RELEASE(2, 0x10); break;
-      case fabgl::VK_KP_PERIOD: RELEASE(2, 0x08); break;
-
-      default: break;
+  for (int i = 0; i < KeyMapSize; i++) {
+    if (KeyMap[i].vk == vk) {
+      if (down)
+        PressKey(KeyMap[i].row, KeyMap[i].mask);
+      else
+        ReleaseKey(KeyMap[i].row, KeyMap[i].mask);
+      return; // cada virtual key aparece una única vez en la tabla
     }
   }
+  // Tecla no mapeada: se ignora silenciosamente (igual que el 'default' original)
 }
 
 // [복구] 키보드 업데이트 함수
@@ -318,18 +246,14 @@ int InitMachine(void) {
   Serial.println("InitMachine: Starting...");
   
   // 객체 연결 및 포인터 설정
-  vga16 = &VGAController;
-
-  if(!vga16) {
+  if (!ensureVga16()) {
     Serial.println("ERROR: VGA16Controller not available!");
     return 0;
   }
   
   // 초기 팔레트 설정 (부팅 직후 화면 색상)
-  if(vga16) {
-    for(int i = 0; i < 16; i++) {
-      vga16->setPaletteItem(i, msxColor(i));
-    }
+  for(int i = 0; i < 16; i++) {
+    vga16->setPaletteItem(i, msxColor(i));
   }
 
   // 화면 버퍼 할당
@@ -361,9 +285,7 @@ void TrashMachine(void) {
 
 extern "C" void SetColor(byte N, byte R, byte G, byte B) {
   if(N >= 16) return;
-  
-  if(!vga16) vga16 = &VGAController;
-  if(!vga16) return;
+  if(!ensureVga16()) return;
   
   // 변환된 색상 적용
   fabgl::RGB888 color = convertColor(R, G, B);

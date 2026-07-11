@@ -903,8 +903,8 @@ int ResetMSX(int NewMode,int NewRAMPages,int NewVRAMPages)
   NewVRAMPages=J;
 
  /* Correct RAM and VRAM sizes */
-  if((NewRAMPages<(MODEL(MSX_MSX1)? 4:8))||(NewRAMPages>256))
-    NewRAMPages=MODEL(MSX_MSX1)? 4:8;
+  if((NewRAMPages<(MODEL(MSX_MSX1)? 1:8))||(NewRAMPages>256))
+    NewRAMPages=MODEL(MSX_MSX1)? 1:8;
   if((NewVRAMPages<(MODEL(MSX_MSX1)? 2:8))||(NewVRAMPages>8))
     NewVRAMPages=MODEL(MSX_MSX1)? 2:8;
 

@@ -1,7 +1,16 @@
 /*
- * TTGO VGA32 MSX Emulator (Improved File Browser with Scrolling)
+ * MSX Emulator for FabGL cards
+ * Mantained by RafaG
  * Based on fMSX by Marat Fayzullin and FabGL by Fabrizio Di Vittorio.
+ * Based on ttgo-msxemul by ChanHyeok Ju
+ *
+ * https://sites.google.com/view/minibotsmuseum
+ * https://minibots.wordpress.com/retroinformatica/
  */
+
+#define MSX_RAM_SIZE 16
+// Opciones permitidas: 16, 32, 64 (en KB).
+// (Los valores como 48 se redondearán internamente a 64 por requerimiento del emulador).
 
 #include "fabgl.h"
 #include "MSX.h"
@@ -103,7 +112,7 @@ void setup() {
 
   // fMSX 초기 설정
   Mode = MSX_MSX1 | MSX_NTSC | MSX_GUESSA | MSX_GUESSB;
-  RAMPages = 4;   
+  RAMPages = MSX_RAM_SIZE / 16; 
   VRAMPages = 2;  
   Verbose = 1;
   ProgDir = "/"; 
