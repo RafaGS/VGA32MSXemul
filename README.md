@@ -10,7 +10,7 @@ MSX Emulator for FabGL cards
 
 This is an MSX1 emulator for ESP32 systems compatible with FabGL/VGA32.
 
-Installation and usage: see MINIBOTS
+Installation and usage: see [MINIBOTS](https://minibots.wordpress.com/)
 
 
 
