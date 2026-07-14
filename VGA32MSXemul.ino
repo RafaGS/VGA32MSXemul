@@ -12,6 +12,30 @@
 // Opciones permitidas: 16, 32, 64 (en KB).
 // (Los valores como 48 se redondearán internamente a 64 por requerimiento del emulador).
 
+#include "esp_system.h"
+
+// Definimos los tipos de placa
+enum BoardType {
+    BOARD_UNKNOWN,
+    BOARD_LILYGO_TTGO_VGA32,
+    BOARD_OLIMEX_FABGL
+};
+
+BoardType detectarPlaca() {
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+
+    // Revisión 1 = TTGO VGA32
+    // Revisión 3 = Olimex FabGL
+    if (chip_info.revision >= 3) {
+        return BOARD_OLIMEX_FABGL;
+    } else if (chip_info.revision == 1) {
+        return BOARD_LILYGO_TTGO_VGA32;
+    }
+    
+    return BOARD_UNKNOWN;
+}
+
 #include "fabgl.h"
 #include "MSX.h"
 #include <SPI.h>
@@ -53,11 +77,11 @@ byte PSLReg = 0;
 // 에뮬레이터 상태
 bool emuRunning = false;
 
-// SD 카드 설정
-#define SD_MISO 2
-#define SD_MOSI 12
-#define SD_CLK  14
-#define SD_CS   13
+// Pines de la MicroSD (variables para poder cambiarlos según la placa)
+int pin_sd_miso = 2;
+int pin_sd_mosi = 12;
+int pin_sd_clk  = 14;
+int pin_sd_cs   = 13;
 
 // 파일 브라우저 설정
 const int MAX_FILES = 200;      // 최대 파일 로드 개수 증가
@@ -69,6 +93,18 @@ void setup() {
   delay(1000);
 
   Serial.println("\n\n=== MSX Emulator Starting ===");
+
+  BoardType miPlaca = detectarPlaca();
+
+  if (miPlaca == BOARD_LILYGO_TTGO_VGA32) {
+      Serial.println("Configurando pines para TTGO VGA32...");
+      pin_sd_miso = 2;
+  } else if (miPlaca == BOARD_OLIMEX_FABGL) {
+      Serial.println("Configurando pines para Olimex FabGL...");
+      pin_sd_miso = 35;
+  } else {
+      Serial.println("Placa no reconocida, usando pines por defecto");
+  }
 
   // PSRAM 초기화 확인
   if (psramInit()) {
@@ -98,9 +134,9 @@ void setup() {
 
   // SD 카드 마운트
   Serial.println("Mounting SD card...");
-  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+  SPI.begin(pin_sd_clk, pin_sd_miso, pin_sd_mosi, pin_sd_cs);
 
-  if (!SD.begin(SD_CS)) {
+  if (!SD.begin(pin_sd_cs)) {
     Serial.println("ERROR: SD Card Mount Failed!");
     Canvas->setPenColor(Color::Red);
     Canvas->drawText(10, 30, "SD Card Mount Failed!");
